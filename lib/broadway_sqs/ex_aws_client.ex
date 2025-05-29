@@ -42,8 +42,8 @@ defmodule BroadwaySQS.ExAwsClient do
         Enum.filter(failed, &ack?(&1, ack_options, :on_failure))
 
     messages_to_nack_with_timeout =
-      collect_messages_to_nack(successful, ack_options, :on_success) ++
-        collect_messages_to_nack(failed, ack_options, :on_failure)
+      Enum.flat_map(successful, &nack(&1, ack_options, :on_success)) ++
+        Enum.flat_map(failed, &nack(&1, ack_options, :on_failure))
 
     messages_to_delete
     |> Enum.chunk_every(@max_num_messages_allowed_by_aws)
@@ -59,16 +59,13 @@ defmodule BroadwaySQS.ExAwsClient do
     (message_ack_options[option] || Map.fetch!(ack_options, option)) == :ack
   end
 
-  defp collect_messages_to_nack(messages, ack_options, option) do
-    Enum.map(messages, fn message ->
-      {_, _, message_ack_options} = message.acknowledger
+  defp nack(message, ack_options, option) do
+    {_, _, message_ack_options} = message.acknowledger
 
-      case message_ack_options[option] || Map.fetch!(ack_options, option) do
-        {:nack, timeout} -> {message, timeout}
-        _ -> nil
-      end
-    end)
-    |> Enum.filter(& &1)
+    case message_ack_options[option] || Map.fetch!(ack_options, option) do
+      {:nack, timeout} -> [{message, timeout}]
+      _ -> []
+    end
   end
 
   @impl Acknowledger
