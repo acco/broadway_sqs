@@ -37,18 +37,39 @@ defmodule BroadwaySQS.ExAwsClient do
   def ack(ack_ref, successful, failed) do
     ack_options = :persistent_term.get(ack_ref)
 
-    messages =
-      Enum.filter(successful, &ack?(&1, ack_options, :on_success)) ++
-        Enum.filter(failed, &ack?(&1, ack_options, :on_failure))
+    success_messages_by_ack_action =
+      Enum.group_by(successful, &ack_action(&1, ack_options, :on_success))
 
-    messages
+    failed_messages_by_ack_action =
+      Enum.group_by(failed, &ack_action(&1, ack_options, :on_failure))
+
+    delete_messages =
+      Map.get(success_messages_by_ack_action, :ack, []) ++
+        Map.get(failed_messages_by_ack_action, :ack, [])
+
+    delete_messages
     |> Enum.chunk_every(@max_num_messages_allowed_by_aws)
-    |> Enum.each(fn messages -> delete_messages(messages, ack_options) end)
+    |> Enum.each(&delete_messages_batch(&1, ack_options))
+
+    change_visibility_entries =
+      collect_nack_entries(success_messages_by_ack_action) ++
+        collect_nack_entries(failed_messages_by_ack_action)
+
+    change_visibility_entries
+    |> Enum.chunk_every(@max_num_messages_allowed_by_aws)
+    |> Enum.each(&change_message_visibility_batch(&1, ack_options))
   end
 
-  defp ack?(message, ack_options, option) do
+  defp collect_nack_entries(messages_by_ack_action) do
+    Enum.flat_map(messages_by_ack_action, fn
+      {{:nack, timeout}, messages} -> Enum.map(messages, &{&1, timeout})
+      _ -> []
+    end)
+  end
+
+  defp ack_action(message, ack_options, option) do
     {_, _, message_ack_options} = message.acknowledger
-    (message_ack_options[option] || Map.fetch!(ack_options, option)) == :ack
+    message_ack_options[option] || Map.fetch!(ack_options, option)
   end
 
   @impl Acknowledger
@@ -56,11 +77,24 @@ defmodule BroadwaySQS.ExAwsClient do
     {:ok, Map.merge(ack_data, Map.new(options))}
   end
 
-  defp delete_messages(messages, ack_options) do
+  defp delete_messages_batch(messages, ack_options) do
     receipts = Enum.map(messages, &extract_message_receipt/1)
 
     ack_options.queue_url
     |> ExAws.SQS.delete_message_batch(receipts)
+    |> ExAws.request!(ack_options.config)
+  end
+
+  defp change_message_visibility_batch(messages, ack_options) do
+    entries =
+      Enum.map(messages, fn {message, timeout} ->
+        message
+        |> extract_message_receipt()
+        |> Map.put(:visibility_timeout, timeout)
+      end)
+
+    ack_options.queue_url
+    |> ExAws.SQS.change_message_visibility_batch(entries)
     |> ExAws.request!(ack_options.config)
   end
 
