@@ -37,18 +37,36 @@ defmodule BroadwaySQS.ExAwsClient do
   def ack(ack_ref, successful, failed) do
     ack_options = :persistent_term.get(ack_ref)
 
-    messages =
-      Enum.filter(successful, &ack?(&1, ack_options, :on_success)) ++
-        Enum.filter(failed, &ack?(&1, ack_options, :on_failure))
+    {delete_messages, change_visibility} =
+      Enum.reduce(successful, {[], []}, fn message, acc ->
+        categorize_message(message, ack_options, :on_success, acc)
+      end)
 
-    messages
+    {delete_messages, change_visibility} =
+      Enum.reduce(failed, {delete_messages, change_visibility}, fn message, acc ->
+        categorize_message(message, ack_options, :on_failure, acc)
+      end)
+
+    delete_messages
     |> Enum.chunk_every(@max_num_messages_allowed_by_aws)
-    |> Enum.each(fn messages -> delete_messages(messages, ack_options) end)
+    |> Enum.each(&delete_messages_batch(&1, ack_options))
+
+    change_visibility
+    |> Enum.chunk_every(@max_num_messages_allowed_by_aws)
+    |> Enum.each(&change_message_visibility_batch(&1, ack_options))
   end
 
-  defp ack?(message, ack_options, option) do
+  defp categorize_message(message, ack_options, option, {acks, nacks}) do
+    case ack_action(message, ack_options, option) do
+      :ack -> {[message | acks], nacks}
+      {:nack, timeout} -> {acks, [{message, timeout} | nacks]}
+      :noop -> {acks, nacks}
+    end
+  end
+
+  defp ack_action(message, ack_options, option) do
     {_, _, message_ack_options} = message.acknowledger
-    (message_ack_options[option] || Map.fetch!(ack_options, option)) == :ack
+    message_ack_options[option] || Map.fetch!(ack_options, option)
   end
 
   @impl Acknowledger
@@ -56,11 +74,24 @@ defmodule BroadwaySQS.ExAwsClient do
     {:ok, Map.merge(ack_data, Map.new(options))}
   end
 
-  defp delete_messages(messages, ack_options) do
+  defp delete_messages_batch(messages, ack_options) do
     receipts = Enum.map(messages, &extract_message_receipt/1)
 
     ack_options.queue_url
     |> ExAws.SQS.delete_message_batch(receipts)
+    |> ExAws.request!(ack_options.config)
+  end
+
+  defp change_message_visibility_batch(messages, ack_options) do
+    entries =
+      Enum.map(messages, fn {message, timeout} ->
+        message
+        |> extract_message_receipt()
+        |> Map.put(:visibility_timeout, timeout)
+      end)
+
+    ack_options.queue_url
+    |> ExAws.SQS.change_message_visibility_batch(entries)
     |> ExAws.request!(ack_options.config)
   end
 
